@@ -34,7 +34,9 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Get VPN Gate nodes, check through Cloudflare Worker, and build page
-        run: python vpngate.py
+        run: |
+          python vpngate.py
+          python build_mihomo.py
         env:
           # 当前项目使用的已部署检测 Worker；这里是调用检测 API，不是部署 Worker。
           CHECK_WORKER: 'https://vpnzhuzhai.cmos.de5.net/check?sstp=vpn:vpn@'
