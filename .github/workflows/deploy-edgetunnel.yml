@@ -28,7 +28,7 @@ jobs:
         run: |
           set -eu
           ACCOUNT_ID='b45acc252ec8c5a10e80dd81f3d0f2a8'
-          DESIRED_SUBDOMAIN='cmosliu969'
+          DESIRED_SUBDOMAIN='cmos969-lxm-r8k2'
           API="https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/subdomain"
           test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Missing CLOUDFLARE_API_TOKEN secret'; exit 1; }
 
