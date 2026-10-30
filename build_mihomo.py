@@ -80,6 +80,21 @@ def main():
         "allow-lan": False,
         "mode": "rule",
         "log-level": "warning",
+        # Resolve proxy-server hostnames over HTTPS; plain DNS on the current
+        # network is returning incorrect addresses for workers.dev.
+        "dns": {
+            "enable": True,
+            "ipv6": False,
+            "enhanced-mode": "fake-ip",
+            "nameserver": [
+                "https://1.1.1.1/dns-query",
+                "https://1.0.0.1/dns-query",
+            ],
+            "proxy-server-nameserver": [
+                "https://1.1.1.1/dns-query",
+                "https://1.0.0.1/dns-query",
+            ],
+        },
         "proxies": proxies,
         "proxy-groups": [
             {
