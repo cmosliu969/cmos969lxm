@@ -37,7 +37,7 @@ jobs:
         run: python vpngate.py
         env:
           # 当前项目使用的已部署检测 Worker；这里是调用检测 API，不是部署 Worker。
-          CHECK_WORKER: 'CHECK_WORKER: 'https://vpnzhuzhai.cmos.de5.net/check?sstp=vpn:vpn@'
+          CHECK_WORKER: 'https://vpnzhuzhai.cmos.de5.net/check?sstp=vpn:vpn@'
           CHECK_CONCURRENCY: '32'
           CHECK_TIMEOUT: '90'
 
