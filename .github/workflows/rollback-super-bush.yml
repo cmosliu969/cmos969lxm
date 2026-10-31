@@ -1,0 +1,130 @@
+name: Rollback Super Bush
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID || 'ce287c6b1c33f1b67b243f34a116cbb4' }}
+  TARGET_WORKER_NAME: super-bush-2e66
+  TARGET_DOMAIN: super-bush-2e66.cmosliu969.workers.dev
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate required secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -eu
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo '::error::Missing secret CLOUDFLARE_API_TOKEN'; exit 1; }
+
+      - name: Write minimal wrangler config
+        run: |
+          set -eu
+          mkdir -p /tmp/rollback-worker
+          cat > /tmp/rollback-worker/_worker.js <<'EOF'
+          export default { async fetch() { return new Response('ok'); } };
+          EOF
+          cat > /tmp/rollback-worker/wrangler.toml <<EOF
+          name = "${TARGET_WORKER_NAME}"
+          account_id = "${ACCOUNT_ID}"
+          main = "_worker.js"
+          compatibility_date = "2025-11-04"
+          EOF
+
+      - name: Find previous deployment
+        id: find
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+
+          account = os.environ['ACCOUNT_ID']
+          script = os.environ['TARGET_WORKER_NAME']
+          token = os.environ['CLOUDFLARE_API_TOKEN']
+          url = f'https://api.cloudflare.com/client/v4/accounts/{account}/workers/scripts/{script}/deployments'
+          req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              data = json.load(r)
+
+          if not data.get('success', False):
+              print('Cloudflare API error:', json.dumps(data.get('errors', []), ensure_ascii=False))
+              sys.exit(1)
+
+          result = data.get('result', {})
+          if isinstance(result, dict):
+              deployments = result.get('deployments', [])
+          elif isinstance(result, list):
+              deployments = result
+          else:
+              deployments = []
+
+          if len(deployments) < 2:
+              print('Not enough deployments to rollback safely.')
+              print(json.dumps(result, ensure_ascii=False, indent=2)[:4000])
+              sys.exit(1)
+
+          deployments.sort(key=lambda d: d.get('created_on', ''), reverse=True)
+          latest = deployments[0]
+          previous = deployments[1]
+
+          print('Latest deployment:')
+          print(json.dumps(latest, ensure_ascii=False, indent=2)[:2000])
+          print('Previous deployment:')
+          print(json.dumps(previous, ensure_ascii=False, indent=2)[:2000])
+
+          versions = previous.get('versions', [])
+          if not versions:
+              print('Previous deployment has no versions.')
+              sys.exit(1)
+
+          target = max(versions, key=lambda v: v.get('percentage', 0))
+          version_id = target.get('version_id')
+          if not version_id:
+              print('Could not find version_id in previous deployment.')
+              sys.exit(1)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write(f'version_id={version_id}\n')
+          print(f'Will rollback to version: {version_id}')
+          PY
+
+      - name: Rollback to previous version
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm install --global wrangler@4.156.0
+          wrangler versions deploy "${{ steps.find.outputs.version_id }}@100%" \
+            --config /tmp/rollback-worker/wrangler.toml \
+            --yes
+
+      - name: Health check after rollback
+        run: |
+          set -eu
+          URL="https://${TARGET_DOMAIN}/"
+          echo "Checking $URL"
+          for i in $(seq 1 18); do
+            STATUS=$(curl -sS -o /tmp/rollback-health.body -w '%{http_code}' "$URL" || true)
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = '200' ] && ! grep -qi 'error code: 1101' /tmp/rollback-health.body; then
+              echo 'Rollback succeeded. Worker is healthy again.'
+              exit 0
+            fi
+            sleep 5
+          done
+          echo '::error::Worker still unhealthy after rollback.'
+          cat /tmp/rollback-health.body || true
+          exit 1
