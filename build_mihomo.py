@@ -11,9 +11,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", "public")
 SOURCE = os.path.join(PUBLIC_DIR, "sub.txt")
-# Cloudflare anycast edge IP for this workers.dev host. Pinning it avoids the
-# user's current broken plain-DNS answers; TLS SNI and WS Host remain the domain.
-EDGE_IP = "104.21.31.106"
+# Use the Relay Worker hostname as the Clash server address.
+# Override with EDT_DOMAIN (GitHub variable) when you bind a custom domain.
+EDGE_SERVER = os.environ.get("EDT_DOMAIN", "cmos969-app-01.cmosliu969.workers.dev")
 DEST = os.path.join(PUBLIC_DIR, "clash.yaml")
 
 
@@ -39,7 +39,7 @@ def convert_link(line):
     proxy = {
         "name": name,
         "type": "vless",
-        "server": EDGE_IP,
+        "server": EDGE_SERVER,
         "port": uri.port or 443,
         "uuid": uri.username,
         "tls": True,

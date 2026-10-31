@@ -407,7 +407,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 
-CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+CHAIN_URL = os.environ.get("CHAIN_URL", "https://cmosliu969.github.io/cmos969lxm/chains.txt")
 
 
 def build_chains_text(data):
@@ -466,7 +466,7 @@ EDGE_HOSTS = [
     if h.strip()
 ]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", "https://cmosliu969.github.io/cmos969lxm/hosts.txt")
 
 
 def build_hosts_text(data):
@@ -522,10 +522,10 @@ def build_hosts_text(data):
 
 
 # edgetunnel 完整订阅 (vless://) 配置
-EDT_UUID = os.environ.get("EDT_UUID", "7581312a-844f-46d2-9a5e-3abd8fa868aa")
-EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "super-bush-2e66.cmosliu969.workers.dev")
+EDT_UUID = os.environ.get("EDT_UUID", "")
+EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "cmos969-app-01.cmosliu969.workers.dev")
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+SUB_URL = os.environ.get("SUB_URL", "https://cmosliu969.github.io/cmos969lxm/sub.txt")
 
 
 def _b64_secret_encode(plaintext, secret):
@@ -563,6 +563,8 @@ def _socks5_account(address, default_port=80):
 def build_sub_text(data):
     """生成 edgetunnel 完整 vless:// 订阅 (链式代理编码在 path)。
     填进 edgetunnel 后台「订阅链接」URL, 客户端定时拉取即可自动轮换。"""
+    if not EDT_UUID:
+        raise SystemExit("EDT_UUID is not set; refusing to generate a subscription with an empty UUID")
     countries = data["countries"]
     lines = [
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
