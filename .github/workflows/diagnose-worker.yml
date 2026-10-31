@@ -1,0 +1,105 @@
+name: Diagnose Worker Runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID || 'ce287c6b1c33f1b67b243f34a116cbb4' }}
+  DIAG_WORKER_NAME: cmos969-diag-01
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate Cloudflare token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -eu
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo '::error::Missing secret CLOUDFLARE_API_TOKEN'; exit 1; }
+
+      - name: Deploy tiny diagnostic Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -eu
+          mkdir -p /tmp/diag
+          cat > /tmp/diag/_worker.js <<'EOF'
+          export default {
+            async fetch(request, env) {
+              const url = new URL(request.url);
+              const out = {
+                ok: true,
+                worker: 'cmos969-diag-01',
+                time: new Date().toISOString(),
+                path: url.pathname,
+                env_keys: Object.keys(env || {}),
+                cf: null,
+                tests: {}
+              };
+              try {
+                out.cf = request.cf ? { colo: request.cf.colo, country: request.cf.country, asn: request.cf.asn } : null;
+              } catch (e) { out.tests.cf_error = String(e); }
+              try {
+                const b = await crypto.subtle.digest('MD5', new TextEncoder().encode('diag'));
+                out.tests.md5 = Array.from(new Uint8Array(b)).map(x => x.toString(16).padStart(2, '0')).join('');
+              } catch (e) { out.tests.md5_error = String(e); }
+              try { out.tests.websocket_pair = typeof WebSocketPair; } catch (e) { out.tests.websocket_pair_error = String(e); }
+              try { out.tests.request_fetcher = typeof request.fetcher; } catch (e) { out.tests.request_fetcher_error = String(e); }
+              try {
+                const r = await fetch('https://example.com/', { method: 'HEAD' });
+                out.tests.fetch_example = r.status;
+              } catch (e) { out.tests.fetch_example_error = String(e); }
+              if (url.pathname === '/ws') {
+                try {
+                  const [client, server] = Object.values(new WebSocketPair());
+                  server.accept();
+                  server.addEventListener('message', () => { try { server.send('pong'); } catch (_) {} });
+                  return new Response(null, { status: 101, webSocket: client });
+                } catch (e) { out.tests.ws_error = String(e); }
+              }
+              return new Response(JSON.stringify(out, null, 2), {
+                headers: { 'content-type': 'application/json; charset=utf-8' }
+              });
+            }
+          };
+          EOF
+          cat > /tmp/diag/wrangler.toml <<EOF
+          name = "${DIAG_WORKER_NAME}"
+          account_id = "${ACCOUNT_ID}"
+          main = "_worker.js"
+          compatibility_date = "2025-11-04"
+          workers_dev = true
+          preview_urls = false
+          EOF
+          npm install --global wrangler@4
+          wrangler deploy --config /tmp/diag/wrangler.toml
+
+      - name: Probe diagnostic Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -eu
+          API="https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/subdomain"
+          SUB=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$API" | jq -r '.result.subdomain // empty')
+          if [ -z "$SUB" ]; then SUB='cmosliu969'; fi
+          URL="https://${DIAG_WORKER_NAME}.${SUB}.workers.dev/"
+          echo "Diagnostic URL: $URL"
+          for i in $(seq 1 12); do
+            STATUS=$(curl -sS -o /tmp/diag.json -w '%{http_code}' "$URL" || true)
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = '200' ]; then cat /tmp/diag.json; exit 0; fi
+            sleep 5
+          done
+          echo '::error::Diagnostic Worker did not return 200. Body:'
+          cat /tmp/diag.json || true
+          exit 1
