@@ -1,4 +1,4 @@
-name: Deploy EdgeTunnel Worker
+name: Deploy Relay Worker
 
 on:
   push:
@@ -10,9 +10,17 @@ on:
 permissions:
   contents: read
 
+env:
+  ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID || 'ce287c6b1c33f1b67b243f34a116cbb4' }}
+  WORKER_NAME: ${{ vars.RELAY_WORKER_NAME || 'cmos969-app-01' }}
+  WORKERS_SUBDOMAIN: ${{ vars.RELAY_WORKERS_SUBDOMAIN || 'cmosliu969' }}
+  CUSTOM_DOMAIN: ${{ vars.RELAY_CUSTOM_DOMAIN }}
+  KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,65 +30,123 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Validate required secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RELAY_UUID: ${{ secrets.RELAY_UUID }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -eu
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo '::error::Missing secret CLOUDFLARE_API_TOKEN'; exit 1; }
+          test -n "$RELAY_UUID" || { echo '::error::Missing secret RELAY_UUID'; exit 1; }
+          test -n "$ADMIN_PASSWORD" || { echo '::error::Missing secret ADMIN_PASSWORD'; exit 1; }
+
       - name: Ensure account workers.dev subdomain
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           set -eu
-          ACCOUNT_ID='ce287c6b1c33f1b67b243f34a116cbb4'
-          DESIRED_SUBDOMAIN='cmosliu969'
           API="https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/subdomain"
-          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Missing CLOUDFLARE_API_TOKEN secret'; exit 1; }
-
           CURRENT=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$API")
           EXISTING=$(printf '%s' "$CURRENT" | jq -r '.result.subdomain // empty')
           if [ -n "$EXISTING" ]; then
-            echo "Account workers.dev subdomain is already registered: $EXISTING"
-            if [ "$EXISTING" != "$DESIRED_SUBDOMAIN" ]; then
-              echo "::error::Update EDT_DOMAIN in check.yml to use ${EXISTING}.workers.dev, then rerun."
-              exit 1
+            echo "workers.dev subdomain: $EXISTING"
+            if [ "$EXISTING" != "$WORKERS_SUBDOMAIN" ]; then
+              echo "::warning::Account subdomain is ${EXISTING}, but RELAY_WORKERS_SUBDOMAIN is ${WORKERS_SUBDOMAIN}. Set RELAY_WORKERS_SUBDOMAIN=${EXISTING} in GitHub variables, or use a custom domain."
             fi
           else
-            echo "Registering account workers.dev subdomain: $DESIRED_SUBDOMAIN"
-            CREATED=$(curl -sS -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'Content-Type: application/json' --data "{\"subdomain\":\"$DESIRED_SUBDOMAIN\"}" "$API")
-            OK=$(printf '%s' "$CREATED" | jq -r '.success // false')
-            if [ "$OK" != 'true' ]; then
-              echo '::error::Cloudflare could not register that workers.dev subdomain:'
-              printf '%s' "$CREATED" | jq -r '.errors[]?.message // empty'
-              exit 1
-            fi
-            echo "Registered: $(printf '%s' "$CREATED" | jq -r '.result.subdomain // empty').workers.dev"
+            echo "Registering workers.dev subdomain: $WORKERS_SUBDOMAIN"
+            CREATED=$(curl -sS -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'Content-Type: application/json' --data "{\"subdomain\":\"$WORKERS_SUBDOMAIN\"}" "$API")
+            printf '%s' "$CREATED" | jq -e '.success == true' >/dev/null || { echo '::error::Failed to register workers.dev subdomain'; printf '%s' "$CREATED" | jq -r '.errors[]?.message'; exit 1; }
           fi
 
-      - name: Fetch pinned EdgeTunnel source and deploy
+      - name: Fetch pinned EdgeTunnel source
+        run: |
+          set -eu
+          git init /tmp/relay
+          git -C /tmp/relay remote add origin https://github.com/cmliu/edgetunnel.git
+          git -C /tmp/relay fetch --depth=1 origin a8ab11125ece9bc27983f609a6359be81b21050c
+          git -C /tmp/relay checkout FETCH_HEAD
+
+      - name: Write wrangler config
+        run: |
+          set -eu
+          {
+            echo "name = \"${WORKER_NAME}\""
+            echo "account_id = \"${ACCOUNT_ID}\""
+            echo 'main = "_worker.js"'
+            echo 'compatibility_date = "2025-11-04"'
+            echo 'keep_vars = true'
+            echo 'workers_dev = true'
+            echo 'preview_urls = false'
+            echo
+            echo '[observability]'
+            echo 'enabled = true'
+            echo 'head_sampling_rate = 1'
+            echo
+            echo '[observability.logs]'
+            echo 'invocation_logs = true'
+            if [ -n "$KV_NAMESPACE_ID" ]; then
+              echo
+              echo '[[kv_namespaces]]'
+              echo 'binding = "KV"'
+              echo "id = \"${KV_NAMESPACE_ID}\""
+            fi
+          } > /tmp/relay/wrangler.toml
+          cat /tmp/relay/wrangler.toml
+
+      - name: Deploy Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           set -eu
-          # Upstream cmliu/edgetunnel, pinned to a known commit (GPL-2.0).
-          git init /tmp/edgetunnel
-          git -C /tmp/edgetunnel remote add origin https://github.com/cmliu/edgetunnel.git
-          git -C /tmp/edgetunnel fetch --depth=1 origin a8ab11125ece9bc27983f609a6359be81b21050c
-          git -C /tmp/edgetunnel checkout FETCH_HEAD
-
-          cat > /tmp/edgetunnel/wrangler.toml <<'TOML'
-          name = "edgetunnel-cmos969"
-          account_id = "ce287c6b1c33f1b67b243f34a116cbb4"
-          main = "_worker.js"
-          compatibility_date = "2025-11-04"
-          workers_dev = true
-          preview_urls = false
-
-          [observability]
-          enabled = true
-          head_sampling_rate = 1
-
-          [observability.logs]
-          invocation_logs = true
-
-          [vars]
-          UUID = "7581312a-844f-46d2-9a5e-3abd8fa868aa"
-          TOML
-
           npm install --global wrangler@4
-          wrangler deploy --config /tmp/edgetunnel/wrangler.toml
+          wrangler deploy --config /tmp/relay/wrangler.toml
+
+      - name: Set Worker secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RELAY_UUID: ${{ secrets.RELAY_UUID }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -eu
+          printf '%s' "$ADMIN_PASSWORD" | wrangler secret put ADMIN --config /tmp/relay/wrangler.toml
+          printf '%s' "$RELAY_UUID" | wrangler secret put UUID --config /tmp/relay/wrangler.toml
+
+      - name: Health check
+        run: |
+          set -eu
+          if [ -n "$CUSTOM_DOMAIN" ]; then
+            URL="https://${CUSTOM_DOMAIN}"
+          else
+            URL="https://${WORKER_NAME}.${WORKERS_SUBDOMAIN}.workers.dev"
+          fi
+          echo "Checking $URL"
+          for i in $(seq 1 18); do
+            STATUS=$(curl -sS -o /tmp/health.body -w '%{http_code}' "$URL/" || true)
+            if [ "$STATUS" = '200' ] && ! grep -qi 'error code: 1101' /tmp/health.body; then
+              echo "Health check passed: $URL"
+              echo "RELAY_URL=$URL" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS"
+            sleep 5
+          done
+          echo '::error::Health check failed. Response body:'
+          cat /tmp/health.body
+          echo
+          echo 'If the body contains error code 1101, the workers.dev subdomain or project name is still flagged.'
+          echo 'Next step: bind a custom domain (Worker -> Settings -> Domains & Routes -> Add Custom Domain),'
+          echo 'then set GitHub variable RELAY_CUSTOM_DOMAIN to that hostname and rerun this workflow.'
+          exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo '## Relay deployed'
+            echo
+            echo "- Worker: \`${WORKER_NAME}\`"
+            echo "- URL: ${RELAY_URL:-not-verified}"
+            echo
+            echo 'Set GitHub variable `EDT_DOMAIN` to the hostname above (without https://) so the node checker generates subscriptions for the new Worker.'
+          } >> "$GITHUB_STEP_SUMMARY"

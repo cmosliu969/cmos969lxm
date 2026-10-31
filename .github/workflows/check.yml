@@ -38,10 +38,11 @@ jobs:
           python vpngate.py
           python build_mihomo.py
         env:
-          # 当前项目使用的已部署检测 Worker；这里是调用检测 API，不是部署 Worker。
+          # 检测用的 Worker（独立于 Relay Worker，保持不变）
           CHECK_WORKER: 'https://vpnzhuzhai.cmos.de5.net/check?sstp=vpn:vpn@'
-          EDT_DOMAIN: 'edgetunnel-cmos969.cmosliu969.workers.dev'
-          EDT_UUID: '7581312a-844f-46d2-9a5e-3abd8fa868aa'
+          # 改成新的 Relay Worker 域名；优先读取 GitHub 变量 EDT_DOMAIN
+          EDT_DOMAIN: ${{ vars.EDT_DOMAIN || 'cmos969-app-01.cmosliu969.workers.dev' }}
+          EDT_UUID: ${{ secrets.RELAY_UUID }}
           CHECK_CONCURRENCY: '32'
           CHECK_TIMEOUT: '90'
 
