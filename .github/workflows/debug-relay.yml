@@ -1,0 +1,143 @@
+name: Debug Relay Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID || 'ce287c6b1c33f1b67b243f34a116cbb4' }}
+  DEBUG_WORKER_NAME: cmos969-debug-01
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate required secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RELAY_UUID: ${{ secrets.RELAY_UUID }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -eu
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo '::error::Missing secret CLOUDFLARE_API_TOKEN'; exit 1; }
+          test -n "$RELAY_UUID" || { echo '::error::Missing secret RELAY_UUID'; exit 1; }
+          test -n "$ADMIN_PASSWORD" || { echo '::error::Missing secret ADMIN_PASSWORD'; exit 1; }
+
+      - name: Fetch pinned EdgeTunnel source
+        run: |
+          set -eu
+          git init /tmp/debug-relay
+          git -C /tmp/debug-relay remote add origin https://github.com/cmliu/edgetunnel.git
+          git -C /tmp/debug-relay fetch --depth=1 origin a8ab11125ece9bc27983f609a6359be81b21050c
+          git -C /tmp/debug-relay checkout FETCH_HEAD
+
+      - name: Write debug wrapper and config
+        run: |
+          set -eu
+          cat > /tmp/debug-relay/debug-entry.js <<'EOF'
+          import worker from './_worker.js';
+
+          export default {
+            async fetch(request, env, ctx) {
+              const url = new URL(request.url);
+              if (url.pathname === '/__debug/health') {
+                return new Response(JSON.stringify({
+                  ok: true,
+                  wrapper: 'debug-entry',
+                  time: new Date().toISOString()
+                }), {
+                  headers: { 'content-type': 'application/json; charset=utf-8' }
+                });
+              }
+              try {
+                return await worker.fetch(request, env, ctx);
+              } catch (err) {
+                return new Response(JSON.stringify({
+                  ok: false,
+                  name: err && err.name ? err.name : null,
+                  message: err && err.message ? err.message : String(err),
+                  stack: err && err.stack ? err.stack : null
+                }, null, 2), {
+                  status: 500,
+                  headers: { 'content-type': 'application/json; charset=utf-8' }
+                });
+              }
+            }
+          };
+          EOF
+          cat > /tmp/debug-relay/wrangler.toml <<EOF
+          name = "${DEBUG_WORKER_NAME}"
+          account_id = "${ACCOUNT_ID}"
+          main = "debug-entry.js"
+          compatibility_date = "2025-11-04"
+          keep_vars = true
+          workers_dev = true
+          preview_urls = false
+
+          [observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [observability.logs]
+          invocation_logs = true
+
+          [vars]
+          DEBUG = "1"
+          EOF
+          cat /tmp/debug-relay/wrangler.toml
+
+      - name: Deploy debug Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -eu
+          npm install --global wrangler@4
+          wrangler deploy --config /tmp/debug-relay/wrangler.toml
+
+      - name: Set debug Worker secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RELAY_UUID: ${{ secrets.RELAY_UUID }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -eu
+          printf '%s' "$ADMIN_PASSWORD" | wrangler secret put ADMIN --config /tmp/debug-relay/wrangler.toml
+          printf '%s' "$RELAY_UUID" | wrangler secret put UUID --config /tmp/debug-relay/wrangler.toml
+
+      - name: Capture real error
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -eu
+          API="https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/subdomain"
+          SUB=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$API" | jq -r '.result.subdomain // empty')
+          if [ -z "$SUB" ]; then SUB='cmosliu969'; fi
+          BASE="https://${DEBUG_WORKER_NAME}.${SUB}.workers.dev"
+          echo "Debug URL: $BASE"
+          echo
+          echo '--- health ---'
+          curl -sS --max-time 30 "$BASE/__debug/health" || true
+          echo
+          echo '--- root response ---'
+          STATUS=$(curl -sS --max-time 30 -o /tmp/debug-root.body -w '%{http_code}' "$BASE/" || true)
+          echo "HTTP $STATUS"
+          cat /tmp/debug-root.body || true
+          echo
+          if grep -q '"stack"' /tmp/debug-root.body; then
+            echo 'Captured JavaScript exception stack.'
+            exit 0
+          fi
+          if [ "$STATUS" = '200' ]; then
+            echo 'Root returned 200.'
+            exit 0
+          fi
+          echo '::error::Did not capture a JavaScript exception. If this is still 1101, the failure may happen before the wrapper can catch it.'
+          exit 1
