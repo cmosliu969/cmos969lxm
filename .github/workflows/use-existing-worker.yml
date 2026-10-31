@@ -25,12 +25,10 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           RELAY_UUID: ${{ secrets.RELAY_UUID }}
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
         run: |
           set -eu
           test -n "$CLOUDFLARE_API_TOKEN" || { echo '::error::Missing secret CLOUDFLARE_API_TOKEN'; exit 1; }
           test -n "$RELAY_UUID" || { echo '::error::Missing secret RELAY_UUID'; exit 1; }
-          test -n "$ADMIN_PASSWORD" || { echo '::error::Missing secret ADMIN_PASSWORD'; exit 1; }
 
       - name: Write minimal wrangler config
         run: |
@@ -46,16 +44,17 @@ jobs:
           compatibility_date = "2025-11-04"
           EOF
 
-      - name: Update secrets on existing healthy Worker
+      - name: Update UUID on existing healthy Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           RELAY_UUID: ${{ secrets.RELAY_UUID }}
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
         run: |
           set -eu
           npm install --global wrangler@4
-          printf '%s' "$ADMIN_PASSWORD" | wrangler secret put ADMIN --config /tmp/existing-worker/wrangler.toml
-          printf '%s' "$RELAY_UUID" | wrangler secret put UUID --config /tmp/existing-worker/wrangler.toml
+          if ! printf '%s' "$RELAY_UUID" | wrangler secret put UUID --config /tmp/existing-worker/wrangler.toml; then
+            echo '::error::Failed to set UUID secret. If Cloudflare says Binding name UUID already in use, open Cloudflare -> Workers & Pages -> super-bush-2e66 -> Settings -> Variables and Secrets, delete the old plain-text UUID variable, then rerun this workflow. Do not delete KV/D1/domain bindings.'
+            exit 1
+          fi
 
       - name: Health check existing Worker
         run: |
