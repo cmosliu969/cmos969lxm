@@ -44,32 +44,50 @@ jobs:
           compatibility_date = "2025-11-04"
           EOF
 
-      - name: Update UUID on existing healthy Worker
+      - name: Update UUID using Worker Versions
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           RELAY_UUID: ${{ secrets.RELAY_UUID }}
         run: |
-          set -eu
-          npm install --global wrangler@4
-          if ! printf '%s' "$RELAY_UUID" | wrangler secret put UUID --config /tmp/existing-worker/wrangler.toml; then
-            echo '::error::Failed to set UUID secret. If Cloudflare says Binding name UUID already in use, open Cloudflare -> Workers & Pages -> super-bush-2e66 -> Settings -> Variables and Secrets, delete the old plain-text UUID variable, then rerun this workflow. Do not delete KV/D1/domain bindings.'
-            exit 1
+          set -euo pipefail
+          npm install --global wrangler@4.156.0
+
+          echo 'Creating a new Worker version with the updated UUID secret...'
+          printf '%s' "$RELAY_UUID" | wrangler versions secret put UUID \
+            --config /tmp/existing-worker/wrangler.toml \
+            --message 'Rotate UUID for VPN subscription' \
+            2>&1 | tee /tmp/versions-secret.log
+
+          VERSION_ID=$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' /tmp/versions-secret.log | tail -n 1 || true)
+
+          if [ -z "$VERSION_ID" ]; then
+            echo 'Version ID not found in Wrangler output; querying Cloudflare API...'
+            VERSION_ID=$(curl -sS \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts/${TARGET_WORKER_NAME}/versions?per_page=1" \
+              | python3 -c 'import sys,json; j=json.load(sys.stdin); print(j["result"][0]["id"])')
           fi
+
+          test -n "$VERSION_ID" || { echo '::error::Could not determine new Worker version ID'; exit 1; }
+          echo "Deploying Worker version: $VERSION_ID"
+          wrangler versions deploy "${VERSION_ID}@100%" \
+            --config /tmp/existing-worker/wrangler.toml \
+            --yes
 
       - name: Health check existing Worker
         run: |
           set -eu
           URL="https://${TARGET_DOMAIN}/"
           echo "Checking $URL"
-          for i in $(seq 1 12); do
+          for i in $(seq 1 18); do
             STATUS=$(curl -sS -o /tmp/existing-health.body -w '%{http_code}' "$URL" || true)
             echo "Attempt $i: HTTP $STATUS"
             if [ "$STATUS" = '200' ] && ! grep -qi 'error code: 1101' /tmp/existing-health.body; then
               echo 'Existing Worker is healthy.'
               echo
-              echo 'Next: set GitHub variable EDT_DOMAIN to:'
-              echo "${TARGET_DOMAIN}"
-              echo 'Then run VPN Gate Node Check and update the client subscription.'
+              echo 'Next: bind custom domain cmos969.cmos.de5.net to super-bush-2e66,'
+              echo 'set GitHub variable EDT_DOMAIN to cmos969.cmos.de5.net,'
+              echo 'then run VPN Gate Node Check and update the client subscription.'
               exit 0
             fi
             sleep 5
