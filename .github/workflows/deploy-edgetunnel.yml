@@ -71,6 +71,13 @@ jobs:
           workers_dev = true
           preview_urls = false
 
+          [observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [observability.logs]
+          invocation_logs = true
+
           [vars]
           UUID = "7581312a-844f-46d2-9a5e-3abd8fa868aa"
           TOML
