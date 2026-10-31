@@ -1,0 +1,80 @@
+name: Use Existing Healthy Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID || 'ce287c6b1c33f1b67b243f34a116cbb4' }}
+  TARGET_WORKER_NAME: super-bush-2e66
+  TARGET_DOMAIN: super-bush-2e66.cmosliu969.workers.dev
+
+jobs:
+  use-existing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate required secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RELAY_UUID: ${{ secrets.RELAY_UUID }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -eu
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo '::error::Missing secret CLOUDFLARE_API_TOKEN'; exit 1; }
+          test -n "$RELAY_UUID" || { echo '::error::Missing secret RELAY_UUID'; exit 1; }
+          test -n "$ADMIN_PASSWORD" || { echo '::error::Missing secret ADMIN_PASSWORD'; exit 1; }
+
+      - name: Write minimal wrangler config
+        run: |
+          set -eu
+          mkdir -p /tmp/existing-worker
+          cat > /tmp/existing-worker/_worker.js <<'EOF'
+          export default { async fetch() { return new Response('ok'); } };
+          EOF
+          cat > /tmp/existing-worker/wrangler.toml <<EOF
+          name = "${TARGET_WORKER_NAME}"
+          account_id = "${ACCOUNT_ID}"
+          main = "_worker.js"
+          compatibility_date = "2025-11-04"
+          EOF
+
+      - name: Update secrets on existing healthy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          RELAY_UUID: ${{ secrets.RELAY_UUID }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -eu
+          npm install --global wrangler@4
+          printf '%s' "$ADMIN_PASSWORD" | wrangler secret put ADMIN --config /tmp/existing-worker/wrangler.toml
+          printf '%s' "$RELAY_UUID" | wrangler secret put UUID --config /tmp/existing-worker/wrangler.toml
+
+      - name: Health check existing Worker
+        run: |
+          set -eu
+          URL="https://${TARGET_DOMAIN}/"
+          echo "Checking $URL"
+          for i in $(seq 1 12); do
+            STATUS=$(curl -sS -o /tmp/existing-health.body -w '%{http_code}' "$URL" || true)
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = '200' ] && ! grep -qi 'error code: 1101' /tmp/existing-health.body; then
+              echo 'Existing Worker is healthy.'
+              echo
+              echo 'Next: set GitHub variable EDT_DOMAIN to:'
+              echo "${TARGET_DOMAIN}"
+              echo 'Then run VPN Gate Node Check and update the client subscription.'
+              exit 0
+            fi
+            sleep 5
+          done
+          echo '::error::Existing Worker health check failed.'
+          cat /tmp/existing-health.body || true
+          exit 1
