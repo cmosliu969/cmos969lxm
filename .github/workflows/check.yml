@@ -40,11 +40,22 @@ jobs:
         env:
           # 检测用的 Worker（独立于 Relay Worker，保持不变）
           CHECK_WORKER: 'https://vpnzhuzhai.cmos.de5.net/check?sstp=vpn:vpn@'
-          # 改成新的 Relay Worker 域名；优先读取 GitHub 变量 EDT_DOMAIN
+          # 优先读取 GitHub 变量 EDT_DOMAIN
           EDT_DOMAIN: ${{ vars.EDT_DOMAIN || 'cmos969-app-01.cmosliu969.workers.dev' }}
-          EDT_UUID: ${{ secrets.RELAY_UUID }}
+          # 公开占位值，仅满足旧脚本的非空要求；不要当作真实 UUID 使用。
+          # 生成的占位订阅只留在运行器，不上传、不发布；请勿用于连接。
+          EDT_UUID: '00000000-0000-4000-8000-000000000000'
           CHECK_CONCURRENCY: '32'
           CHECK_TIMEOUT: '90'
+
+      # 仅复制已知的公开网页及 VPN Gate 数据，不包含 sub.txt 或 clash.yaml。
+      - name: Prepare public Pages files
+        shell: bash
+        run: |
+          set -eu
+          rm -rf -- pages-public
+          mkdir -- pages-public
+          cp -- public/index.html public/data.json public/chains.txt public/hosts.txt pages-public/
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -54,8 +65,15 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: public
+          path: pages-public
 
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
