@@ -1,0 +1,427 @@
+name: Create a NEW private relay (manual only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# EdgeTunnel upstream is GPL-2.0: https://github.com/cmliu/edgetunnel/blob/a8ab11125ece9bc27983f609a6359be81b21050c/LICENSE
+
+# This file never uses RELAY_WORKER_NAME or RELAY_UUID from the old Worker.
+# Every run chooses a new random Worker name. Do not rerun casually: a prior
+# run may already have created a partially configured Worker.
+env:
+  ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID || 'ce287c6b1c33f1b67b243f34a116cbb4' }}
+
+jobs:
+  create-new:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Validate required inputs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRIVATE_SUB_TOKEN: ${{ secrets.PRIVATE_SUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ACCOUNT_ID" =~ ^[a-fA-F0-9]{32}$ ]] || { echo 'Invalid CF_ACCOUNT_ID'; exit 1; }
+          [[ -n "$CLOUDFLARE_API_TOKEN" ]] || { echo 'Missing CLOUDFLARE_API_TOKEN'; exit 1; }
+          [[ "$PRIVATE_SUB_TOKEN" =~ ^[a-f0-9]{64}$ ]] || { echo 'PRIVATE_SUB_TOKEN must be 64 lowercase hex characters'; exit 1; }
+
+      - name: Fetch and verify pinned upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Self-contained: no other repository files or checkout required.
+          PROJECT="${RUNNER_TEMP}/relay-new-build"
+          mkdir -p "$PROJECT/src"
+          cat > "$PROJECT/src/lib.mjs" <<'PRIVATE_RELAY_LIB'
+          // Private relay support code. This file contains no real credentials.
+          // The upstream relay is GPL-2.0; see LICENSE-EdgeTunnel-GPL-2.0.txt.
+          export const DATA_URL = 'https://cmosliu969.github.io/cmos969lxm/data.json';
+          const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+          const HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.opengw\.net$/;
+          const WORKER_HOST_RE = /^[a-z0-9-]{1,63}\.[a-z0-9-]{1,63}\.workers\.dev$/;
+          const TOKEN_RE = /^[0-9a-f]{64}$/;
+          const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+          const MAX_ITEMS = 200;
+          
+          export function validConfig(env) {
+            return typeof env.UUID === 'string' && UUID_RE.test(env.UUID)
+              && typeof env.SUB_TOKEN === 'string' && TOKEN_RE.test(env.SUB_TOKEN)
+              && typeof env.RELAY_HOST === 'string' && WORKER_HOST_RE.test(env.RELAY_HOST);
+          }
+          
+          function encodeChain(chain, uuid) {
+            const bytes = new TextEncoder().encode(JSON.stringify(chain));
+            const key = new TextEncoder().encode(uuid);
+            let mixed = '';
+            for (let i = 0; i < bytes.length; i++) mixed += String.fromCharCode(bytes[i] ^ key[i % key.length]);
+            return btoa(mixed);
+          }
+          
+          export function pathForNode(hostname, port, uuid) {
+            if (!HOST_RE.test(hostname) || !Number.isInteger(port) || port < 1 || port > 65535 || !UUID_RE.test(uuid)) {
+              throw new Error('invalid node');
+            }
+            const chain = { type: 'sstp', username: 'vpn', password: 'vpn', hostname, port };
+            const encoded = encodeChain(chain, uuid);
+            // Upstream strips trailing slashes before decoding; never generate one.
+            if (encoded.endsWith('/')) throw new Error('unrepresentable node path');
+            return '/video/' + encodeURIComponent(encoded);
+          }
+          
+          // This validation is deliberately fail-closed: malformed paths must never
+          // fall back to the upstream relay's direct-outbound branch.
+          export function validChainPath(url, uuid) {
+            if (url.search || !UUID_RE.test(uuid) || url.pathname.length > 1024) return false;
+            try {
+              const path = decodeURIComponent(url.pathname);
+              if (!path.startsWith('/video/')) return false;
+              const encoded = path.slice('/video/'.length);
+              if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || encoded.endsWith('/')) return false;
+              const binary = atob(encoded);
+              if (btoa(binary) !== encoded) return false;
+              const key = new TextEncoder().encode(uuid);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) ^ key[i % key.length];
+              const chain = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+              const keys = Object.keys(chain).sort().join(',');
+              const valid = keys === 'hostname,password,port,type,username'
+                && chain.type === 'sstp'
+                && chain.username === 'vpn' && chain.password === 'vpn'
+                && typeof chain.hostname === 'string' && HOST_RE.test(chain.hostname)
+                && Number.isInteger(chain.port) && chain.port >= 1 && chain.port <= 65535;
+              if (!valid) return false;
+              // Accept only the exact JSON encoding we generate, not alternate JSON,
+              // duplicate keys, trailing whitespace or other parser ambiguities.
+              const canonical = { type: 'sstp', username: 'vpn', password: 'vpn', hostname: chain.hostname, port: chain.port };
+              return encoded === encodeChain(canonical, uuid);
+            } catch (_) {
+              return false;
+            }
+          }
+          
+          export function makeProxies(data, env, now = Date.now()) {
+            if (!validConfig(env) || !data || typeof data !== 'object' || !data.countries || typeof data.countries !== 'object') {
+              throw new Error('invalid data or configuration');
+            }
+            const stamp = Date.parse(data.generated_at);
+            if (!Number.isFinite(stamp) || stamp > now + 5 * 60 * 1000 || now - stamp > MAX_AGE_MS) {
+              throw new Error('node data is stale or invalid');
+            }
+            const results = [];
+            const seen = new Set();
+            for (const group of Object.values(data.countries)) {
+              if (!group || !Array.isArray(group.nodes)) continue;
+              const code = String(group.code || 'XX').toUpperCase();
+              if (!/^[A-Z]{2,3}$/.test(code)) continue;
+              for (const node of group.nodes) {
+                if (!node || node.success !== true || node.status !== 'success' || String(node.protocol).toLowerCase() !== 'sstp') continue;
+                const hostname = typeof node.host === 'string' ? node.host.toLowerCase() : '';
+                const port = node.port;
+                if (!HOST_RE.test(hostname) || !Number.isInteger(port) || port < 1 || port > 65535) continue;
+                const key = `${hostname}:${port}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                results.push({ code, hostname, port, latency: Number.isFinite(node.latency_ms) && node.latency_ms >= 0 ? node.latency_ms : Infinity });
+              }
+            }
+            results.sort((a, b) => a.code.localeCompare(b.code) || a.latency - b.latency || a.hostname.localeCompare(b.hostname) || a.port - b.port);
+            if (!results.length) throw new Error('no eligible nodes');
+            return results.slice(0, MAX_ITEMS).map(({ code, hostname, port }) => ({
+              name: `${code}-${hostname.split('.')[0]}-${port}`,
+              type: 'vless',
+              server: env.RELAY_HOST,
+              port: 443,
+              uuid: env.UUID,
+              tls: true,
+              servername: env.RELAY_HOST,
+              'client-fingerprint': 'chrome',
+              network: 'ws',
+              udp: false,
+              'ws-opts': { path: pathForNode(hostname, port, env.UUID), headers: { Host: env.RELAY_HOST } },
+            }));
+          }
+          PRIVATE_RELAY_LIB
+          cat > "$PROJECT/src/index.mjs" <<'PRIVATE_RELAY_INDEX'
+          // New, independent Worker; no call to the old Worker or old GitHub workflow.
+          // No real secrets are embedded here. GPL-2.0 upstream; see the included license.
+          import relay from './vendor.mjs';
+          import { DATA_URL, validConfig, validChainPath, makeProxies } from './lib.mjs';
+          
+          const MAX_SOURCE_BYTES = 1024 * 1024;
+          const headers = {
+            'Cache-Control': 'private, no-store, max-age=0',
+            'X-Content-Type-Options': 'nosniff',
+            'Referrer-Policy': 'no-referrer',
+          };
+          const reply = (status, text) => new Response(text, { status, headers });
+          
+          async function authorized(request, token) {
+            const enc = new TextEncoder();
+            const [provided, expected] = await Promise.all([
+              crypto.subtle.digest('SHA-256', enc.encode(request.headers.get('authorization') || '')),
+              crypto.subtle.digest('SHA-256', enc.encode(`Bearer ${token}`)),
+            ]);
+            return crypto.subtle.timingSafeEqual(provided, expected);
+          }
+          
+          async function readSource() {
+            const response = await fetch(DATA_URL, {
+              method: 'GET',
+              headers: { Accept: 'application/json' },
+              // Workers support manual/follow; reject all 3xx via !response.ok below.
+              redirect: 'manual',
+              cache: 'no-store',
+              signal: AbortSignal.timeout(12000),
+            });
+            if (!response.ok || !response.body) throw new Error('source unavailable');
+            const declared = Number(response.headers.get('content-length') || 0);
+            if (declared > MAX_SOURCE_BYTES) throw new Error('source too large');
+            const reader = response.body.getReader();
+            const chunks = [];
+            let size = 0;
+            try {
+              for (;;) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                size += value.byteLength;
+                if (size > MAX_SOURCE_BYTES) throw new Error('source too large');
+                chunks.push(value);
+              }
+            } catch (error) {
+              await reader.cancel().catch(() => {});
+              throw error;
+            } finally {
+              reader.releaseLock();
+            }
+            const bytes = new Uint8Array(size);
+            let offset = 0;
+            for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+            return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+          }
+          
+          export default {
+            async fetch(request, env, ctx) {
+              try {
+                if (!validConfig(env)) return reply(503, 'not configured');
+                const url = new URL(request.url);
+                if (url.protocol !== 'https:' || url.hostname !== env.RELAY_HOST || request.method !== 'GET') return reply(404, 'not found');
+                const websocket = (request.headers.get('upgrade') || '').toLowerCase() === 'websocket';
+                if (websocket) {
+                  if (!validChainPath(url, env.UUID)) return reply(404, 'not found');
+                  // Do not pass dashboard KV/Telegram/DEBUG or any user-supplied env to
+                  // upstream. UUID still authenticates the VLESS data inside WebSocket.
+                  return await relay.fetch(request, { UUID: env.UUID, ADMIN: env.UUID, OFF_LOG: 'true' }, ctx);
+                }
+                if (url.pathname === '/health' && !url.search) return reply(200, 'relay ready');
+                if (url.pathname !== '/provider' || url.search || !(await authorized(request, env.SUB_TOKEN))) return reply(404, 'not found');
+                const proxies = makeProxies(await readSource(), env);
+                return new Response(JSON.stringify({ proxies }), {
+                  status: 200,
+                  headers: { ...headers, 'Content-Type': 'application/json; charset=utf-8', Vary: 'Authorization' },
+                });
+              } catch (_) {
+                // Never expose or log upstream errors, URLs, credentials or node paths.
+                return reply(503, 'temporarily unavailable');
+              }
+            },
+          };
+          PRIVATE_RELAY_INDEX
+          cat > "$PROJECT/prepare.mjs" <<'PRIVATE_RELAY_PREPARE'
+          // Build a local vendor module from the exact pinned EdgeTunnel source.
+          // Modified for this project: use Cloudflare's public TCP sockets API,
+          // require global SSTP without fallback, and disable UDP at parser/sink level.
+          // Copyright/license of upstream applies; see LICENSE-EdgeTunnel-GPL-2.0.txt.
+          import { readFile, writeFile } from 'node:fs/promises';
+          import { createHash } from 'node:crypto';
+          import { fileURLToPath } from 'node:url';
+          
+          const expected = '1e84d11af0544654bf56a06fa833e77184a57193288a9ffccf62c031a9fb7d65';
+          if (process.argv.length !== 3) throw new Error('Usage: node prepare.mjs <pinned-upstream-file>');
+          const source = await readFile(process.argv[2]);
+          if (createHash('sha256').update(source).digest('hex') !== expected) throw new Error('Pinned upstream SHA-256 mismatch; refusing to build');
+          const original = `function 创建请求TCP连接器(request) {
+          \tconst 请求对象 = /** @type {any} */ (request);
+          \tconst fetcher = 请求对象?.fetcher;
+          \tif (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
+          \treturn (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+          }`;
+          const replacement = `function 创建请求TCP连接器(request) {
+          \treturn (options, init) => init === undefined ? connect(options) : connect(options, init);
+          }`;
+          let text = source.toString('utf8');
+          function patchOnce(before, after, label) {
+            if (text.split(before).length !== 2) throw new Error(`Expected exactly one ${label} patch point`);
+            text = text.replace(before, after);
+          }
+          patchOnce(original, replacement, 'TCP connector');
+          // Check the routing context that upstream actually parsed, not only the path
+          // independently validated by the wrapper. A parse failure must never direct-connect.
+          const wsStart = "\t\t} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理\n\t\t\tconst 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);\n";
+          const wsGuard = `\t\t\tconst 强制SSTP参数 = 反代上下文.代理参数;
+          \t\t\tif (反代上下文.代理类型 !== 'sstp' || 反代上下文.代理全局 !== true || 反代上下文.反代兜底 !== false
+          \t\t\t\t|| !强制SSTP参数 || 强制SSTP参数.username !== 'vpn' || 强制SSTP参数.password !== 'vpn'
+          \t\t\t\t|| typeof 强制SSTP参数.hostname !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.opengw\\.net$/.test(强制SSTP参数.hostname)
+          \t\t\t\t|| !Number.isInteger(强制SSTP参数.port) || 强制SSTP参数.port < 1 || 强制SSTP参数.port > 65535) {
+          \t\t\t\treturn new Response('not found', { status: 404 });
+          \t\t\t}
+          `;
+          patchOnce(wsStart, wsStart + wsGuard, 'WebSocket SSTP guard');
+          // The wrapper only accepts GET WebSockets with a validated SSTP chain path.
+          // Disable UDP at both WS protocol parsers and forwarding sinks as defense in
+          // depth: untrusted clients must not be able to send DNS outside the SSTP path.
+          patchOnce(
+            "\tif (cmd === 1) { } else if (cmd === 2) { isUDP = true } else { return { hasError: true, message: 'Invalid command' } }",
+            "\tif (cmd !== 1) return { hasError: true, message: 'Only TCP is enabled' };",
+            'VLESS command',
+          );
+          patchOnce(
+            '\tif (cmd !== 1 && cmd !== 3) return { hasError: true, message: "unsupported command, only TCP/UDP is allowed" };\n\tconst isUDP = cmd === 3;',
+            "\tif (cmd !== 1) return { hasError: true, message: 'Only TCP is enabled' };\n\tconst isUDP = false;",
+            'Trojan command',
+          );
+          for (const signature of [
+            'async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {',
+            'async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {',
+            'async function 转发木马UDP反代数据(chunk, webSocket, 上下文, request) {',
+          ]) patchOnce(signature, `${signature}\n\tthrow new Error('UDP is disabled');`, 'UDP sink');
+          const notice = '// Modified: use cloudflare:sockets; enforce global SSTP; disable UDP. GPL-2.0; see LICENSE-EdgeTunnel-GPL-2.0.txt.\n';
+          const result = notice + "import { connect } from 'cloudflare:sockets';\n" + text;
+          await writeFile(fileURLToPath(new URL('./src/vendor.mjs', import.meta.url)), result, { encoding: 'utf8', mode: 0o644 });
+          console.log('Pinned upstream verified; local vendor module prepared.');
+          PRIVATE_RELAY_PREPARE
+          UPSTREAM="${RUNNER_TEMP}/relay-upstream.js"
+          trap 'rm -f "$UPSTREAM"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 120 --max-filesize 10485760 \
+            'https://raw.githubusercontent.com/cmliu/edgetunnel/a8ab11125ece9bc27983f609a6359be81b21050c/_worker.js' \
+            --output "$UPSTREAM"
+          node "$PROJECT/prepare.mjs" "$UPSTREAM"
+
+      - name: Validate public node data before creating anything
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'PUBLIC_NODE_PREFLIGHT'
+          import { join } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const lib = await import(pathToFileURL(join(process.env.RUNNER_TEMP, 'relay-new-build/src/lib.mjs')).href);
+          const r = await fetch(lib.DATA_URL, { redirect: 'manual', signal: AbortSignal.timeout(15000) });
+          if (!r.ok || !r.body) throw new Error('Public node data is unavailable; nothing has been deployed');
+          let size = 0; const parts = [];
+          for await (const part of r.body) {
+            size += part.byteLength;
+            if (size > 1024 * 1024) throw new Error('Public node data is too large; nothing has been deployed');
+            parts.push(part);
+          }
+          const fake = { UUID: '11111111-1111-4111-8111-111111111111', SUB_TOKEN: 'a'.repeat(64), RELAY_HOST: 'fixture.testing.workers.dev' };
+          let proxies;
+          try { proxies = lib.makeProxies(JSON.parse(Buffer.concat(parts).toString('utf8')), fake); }
+          catch (_) { throw new Error('Public node data is empty, invalid or over 24 hours old; run the node checker first. Nothing has been deployed.'); }
+          console.log(`Public data preflight: ${proxies.length} eligible nodes; reachability is not guaranteed.`);
+          PUBLIC_NODE_PREFLIGHT
+
+      - name: Select a fresh name and check account
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          HFILE="$(mktemp "${RUNNER_TEMP}/cf-header.XXXXXX")"
+          BODY="$(mktemp "${RUNNER_TEMP}/cf-body.XXXXXX")"
+          trap 'rm -f "$HFILE" "$BODY"' EXIT
+          chmod 600 "$HFILE" "$BODY"
+          printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN" > "$HFILE"
+          API="https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}"
+          curl --fail --silent --show-error --connect-timeout 15 --max-time 30 -H "@${HFILE}" "$API/workers/subdomain" -o "$BODY"
+          SUBDOMAIN="$(jq -er 'select(.success == true) | .result.subdomain | select(type == "string" and test("^[a-z0-9-]{1,63}$"))' "$BODY")"
+          SUFFIX="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(12).toString("hex"))')"
+          WORKER_NAME="cmos969-relay-${SUFFIX}"
+          RELAY_HOST="${WORKER_NAME}.${SUBDOMAIN}.workers.dev"
+          [[ "$WORKER_NAME" != 'cmos969-app-01' ]] || exit 1
+          # The 404 must specifically be Cloudflare's Worker-not-found code.
+          CODE="$(curl --silent --show-error --connect-timeout 15 --max-time 30 -H "@${HFILE}" -o "$BODY" -w '%{http_code}' "$API/workers/scripts/$WORKER_NAME")"
+          [[ "$CODE" == 404 ]] && jq -e '.success == false and any(.errors[]?; .code == 10007)' "$BODY" >/dev/null || {
+            echo 'Cannot establish that the new name is unused; no deployment attempted.'; exit 1;
+          }
+          printf 'WORKER_NAME=%s\nRELAY_HOST=%s\n' "$WORKER_NAME" "$RELAY_HOST" >> "$GITHUB_ENV"
+          echo "New Worker name: $WORKER_NAME"
+          echo "New Worker host: $RELAY_HOST"
+
+      - name: Install pinned Wrangler
+        shell: bash
+        run: npm install --global --no-audit --no-fund wrangler@4.163.0
+
+      - name: Deploy new Worker with fresh secrets; perform basic checks
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRIVATE_SUB_TOKEN: ${{ secrets.PRIVATE_SUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          SECRET_FILE="${RUNNER_TEMP}/new-relay-secrets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          HEADER_FILE="${RUNNER_TEMP}/new-relay-header-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
+          PROVIDER_FILE="${RUNNER_TEMP}/new-relay-provider-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          CONFIG_FILE="${RUNNER_TEMP}/relay-new-build/wrangler.toml"
+          export SECRET_FILE
+          trap 'rm -f "$SECRET_FILE" "$HEADER_FILE" "$PROVIDER_FILE" "$CONFIG_FILE"' EXIT
+          # Register the fresh UUID with the runner's masker and write it to a
+          # restricted temporary file; never an artifact, CLI arg, or step output.
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const secret = { UUID: crypto.randomUUID(), SUB_TOKEN: process.env.PRIVATE_SUB_TOKEN };
+          // GitHub Actions handles this command as a mask registration, not an output.
+          process.stdout.write(`::add-mask::${secret.UUID}\n`);
+          fs.writeFileSync(process.env.SECRET_FILE, JSON.stringify(secret), { mode: 0o600, flag: 'wx' });
+          NODE
+          cat > "$CONFIG_FILE" <<EOF
+          name = "$WORKER_NAME"
+          account_id = "$ACCOUNT_ID"
+          main = "src/index.mjs"
+          compatibility_date = "2025-11-04"
+          workers_dev = true
+          preview_urls = false
+          [vars]
+          RELAY_HOST = "$RELAY_HOST"
+          [secrets]
+          required = ["UUID", "SUB_TOKEN"]
+          [observability]
+          enabled = false
+          EOF
+          wrangler deploy --config "$CONFIG_FILE" --secrets-file "$SECRET_FILE"
+          BASE="https://${RELAY_HOST}"
+          curl --fail --silent --show-error --retry 3 --retry-delay 5 --retry-all-errors --max-time 20 "$BASE/health" -o /dev/null
+          CODE="$(curl --silent --show-error --max-time 20 -o /dev/null -w '%{http_code}' "$BASE/provider")"
+          [[ "$CODE" == 404 ]] || { echo 'Unauthenticated provider check failed'; exit 1; }
+          printf 'Authorization: Bearer %s\n' "$PRIVATE_SUB_TOKEN" > "$HEADER_FILE"
+          curl --fail --silent --show-error --retry 2 --retry-delay 3 --retry-all-errors --max-time 30 -H "@${HEADER_FILE}" "$BASE/provider" -o "$PROVIDER_FILE"
+          export PROVIDER_FILE
+          node <<'NODE'
+          const fs = require('node:fs');
+          const expected = JSON.parse(fs.readFileSync(process.env.SECRET_FILE, 'utf8'));
+          const data = JSON.parse(fs.readFileSync(process.env.PROVIDER_FILE, 'utf8'));
+          if (!Array.isArray(data.proxies) || !data.proxies.length || !data.proxies.every(p =>
+            p.type === 'vless' && p.uuid === expected.UUID && p.server === process.env.RELAY_HOST && p.port === 443)) {
+            throw new Error('Authenticated provider validation failed');
+          }
+          console.log(`Authenticated provider returned ${data.proxies.length} nodes. End-to-end proxy traffic is NOT tested by this job.`);
+          NODE
+          {
+            echo '## New relay created'
+            echo
+            echo "- New Worker: \`$WORKER_NAME\`"
+            echo "- Host: \`$RELAY_HOST\`"
+            echo '- Authentication and provider format checked; actual client and SSTP end-to-end traffic still need verification.'
+            echo '- The old Worker was not targeted. Do not publish your token, UUID, provider response, or client profile.'
+          } >> "$GITHUB_STEP_SUMMARY"
